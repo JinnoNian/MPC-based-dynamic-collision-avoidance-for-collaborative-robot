@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Dec  9 15:58:58 2024
+
+@author: constantinesun
+"""
+
+import numpy as np
+from pyswarm import pso
+import cvxpy as cp
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from mpl_toolkits.mplot3d import Axes3D
+import random
+import math
+
+# Parameter settings
+dt = 0.05  # Time step (reduced for finer control)
+N = 20  # Prediction horizon (increased for better foresight)
+epsilon_0 = 0.1  # Initial safety distance
+max_noise = 1  # Maximum value of Gaussian noise
+epsilon_outer = 0  # Outer safety distance
+velocity_limit = 1.5/5  # Maximum velocity
+acceleration_limit = 1 / 5  # Maximum acceleration
+max_steps = 300  # Maximum number of steps
+tolerance = 0.01  # Stop condition: deviation from target below this value
+large_penalty = 1e8  # Penalty value
+
+# System matrices
+A = np.array([[1, 0, 0, dt, 0, 0],
+              [0, 1, 0, 0, dt, 0],
+              [0, 0, 1, 0, 0, dt],
+              [0, 0, 0, 1, 0, 0],
+              [0, 0, 0, 0, 1, 0],
+              [0, 0, 0, 0, 0, 1]])
+B = np.array([[0, 0, 0],
+              [0, 0, 0],
+              [0, 0, 0],
+              [dt, 0, 0],
+              [0, dt, 0],
+              [0, 0, dt]])
+
+# Initial and target states
+x0 = np.array([0, 0, 0, 0, 0, 0])  # [x, y, z, vx, vy, vz]
+xd = np.array([1, 1, 1, 0, 0, 0])  # [x, y, z, vx, vy, vz]
+
+# Obstacle parameters
+obstacle_start = np.array([0, 0.5, 0.5])  # Initial position
+obstacle_speed = 0.2  # Obstacle speed
+
+# Penalty matrices
+Q = 10 * np.diag([10, 10, 10, 1, 1, 1])
+R = 0.5 * np.eye(3)
+Qf = Q * 10  # Terminal cost
+
+# Simulation and preceding horizon control
+x_current = x0.copy()
+trajectory = [x_current.copy()]
+obstacle_positions = []
+
+# Initialize epsilon
+epsilon = epsilon_0
+epsilon_history = []  # Record epsilon for each step
+
+for step in range(max_steps):
+    # Update obstacle position
+    nop = np.clip(0.1 * np.random.normal(0.05, 0.1), -0.05, 0.05)
+    obstacle_pos = obstacle_start + np.array([obstacle_speed * step * dt + nop, 0.2 * np.sin(0.1 * step + nop), 0.2 * np.cos(0.1 * step + nop)])
+    obstacle_positions.append(obstacle_pos)
+
+    # Calculate the distance between the robot and the obstacle
+    distance = np.linalg.norm(x_current[:3] - obstacle_pos)
+
+    # Add Gaussian noise
+    noise = np.random.normal(0, max_noise)
+    confidence = 1 - abs(noise) / max_noise
+    v = obstacle_speed  # Magnitude of obstacle velocity
+    epsilon = 3 * abs(1 * v * dt * (1 - confidence))
+    epsilon_history.append(epsilon)
+
+    if x_current[2] > 3:
+        # Use traditional convex optimization (cvxpy)
+        u = cp.Variable((N, 3))
+        x = x_current.copy()
+        total_cost = 0
+
+        constraints = []
+
+        for k in range(N):
+            # Update state
+            x = A @ x + B @ u[k, :]
+
+            # Target cost
+            cost = cp.quad_form(x - xd, Q) + cp.quad_form(u[k, :], R)
+            total_cost += cost
+
+            # Acceleration constraints
+            constraints += [
+                cp.abs(u[k, :]) <= acceleration_limit,
+                -0.5 <= x[0], x[0] <= 1.5,
+                -0.5 <= x[1], x[1] <= 1.5,
+                -0.5 <= x[2], x[2] <= 1.5
+            ]
+
+        # Terminal cost
+        terminal_cost = cp.quad_form(x - xd, Qf)
+        total_cost += terminal_cost
+
+        # Solve the convex optimization problem
+        problem = cp.Problem(cp.Minimize(total_cost), constraints)
+        problem.solve()
+
+        # Get the optimal first control input
+        u_optimal = u.value[0, :]
+
+    else:
+        # Use particle swarm optimization and simulated annealing
+        def fitness(u_sequence, x_current):
+            x = x_current.copy()
+            total_cost = 0
+
+            # Split control input sequence
+            u_sequence = np.array(u_sequence).reshape(N, 3)
+
+            for k in range(N):
+                # Get the current control input
+                u = u_sequence[k]
+
+                # Update state
+                x = A @ x + B @ u
+
+                # Check safety distance constraints and introduce potential field
+                distance = np.linalg.norm(x[:3] - obstacle_pos)
+
+                # Adjust safety distance to account for noise
+                adjusted_epsilon = epsilon + max_noise  # Adjust safety distance by noise upper limit
+
+                if distance < adjusted_epsilon:
+                    return large_penalty  # Strong penalty for infeasible solutions
+
+                # Dynamically penalize acceleration and velocity; closer distances incur larger penalties
+                dynamic_R = 0.01 * R * (1 + 5 * (adjusted_epsilon / max(distance, adjusted_epsilon)))
+                cost = (x - xd).T @ Q @ (x - xd) + u.T @ dynamic_R @ u
+
+                # Check acceleration and velocity constraints
+                if np.any(np.abs(u) > acceleration_limit) or np.any(np.abs(x[3:]) > velocity_limit):
+                    return large_penalty  # Strong penalty for infeasible solutions
+
+                # Check position constraints
+                if not (-0.5 <= x[0] <= 1.5 and -0.5 <= x[1] <= 1.5 and -0.5 <= x[2] <= 1.5):
+                    return large_penalty  # Strong penalty for infeasible solutions
+
+                total_cost += cost
+
+            # Terminal cost
+            terminal_cost = (x - xd).T @ Qf @ (x - xd)
+            total_cost += terminal_cost
+
+            return total_cost
+
+        # Simulated annealing function
+        def simulated_annealing(fitness, x_current, bounds, maxiter=1000, initial_temp=100, cooling_rate=0.95):
+            current_solution = [random.uniform(bounds[0], bounds[1]) for _ in range(N * 3)]
+            current_cost = fitness(current_solution, x_current)
+            best_solution = current_solution.copy()
+            best_cost = current_cost
+            temperature = initial_temp
+
+            for i in range(maxiter):
+                new_solution = current_solution.copy()
+                for j in range(len(new_solution)):
+                    new_solution[j] += random.uniform(-1, 1) * temperature
+                    new_solution[j] = max(min(new_solution[j], bounds[1]), bounds[0])
+
+                new_cost = fitness(new_solution, x_current)
+                if new_cost < current_cost or random.uniform(0, 1) < math.exp((current_cost - new_cost) / temperature):
+                    current_solution = new_solution
+                    current_cost = new_cost
+
+                if new_cost < best_cost:
+                    best_solution = new_solution
+                    best_cost = new_cost
+
+                temperature *= cooling_rate
+
+            return best_solution, best_cost
+
+        lb = -acceleration_limit  # Lower bound of control inputs
+        ub = acceleration_limit  # Upper bound of control inputs
+
+        # Run particle swarm optimization and simulated annealing
+        best_control_sequence, best_cost = pso(fitness, [lb] * (N * 3), [ub] * (N * 3), args=(x_current,), swarmsize=50, maxiter=100)
+
+        # Run simulated annealing for further optimization
+        sa_control_sequence, sa_cost = simulated_annealing(fitness, x_current, (lb, ub))
+
+        # Select the optimal result between the two methods
+        if sa_cost < best_cost:
+            u_optimal = sa_control_sequence[:3]
+        else:
+            u_optimal = best_control_sequence[:3]
+
+    # Update the system state
+    x_current = A @ x_current + B @ u_optimal
+
+    # Check position constraints
+    print(f"Step {step}, x_current: {x_current}, u_optimal: {u_optimal}")
+    if not (-0.5 <= x_current[0] <= 1.5 and -0.5 <= x_current[1] <= 1.5 and -0.5 <= x_current[2] <= 1.5):
+        print(f"Out of bounds at step {step}")
+        break
+
+    trajectory.append(x_current.copy())
+
+    # Check if the target is reached
+    if np.linalg.norm(x_current[:3] - xd[:3]) < tolerance:
+        print(f"Reached the target at step {step}")
+        break
+
+# Visualization and GIF generation
+trajectory = np.array(trajectory)
+obstacle_positions = np.array(obstacle_positions)
+
+fig = plt.figure(figsize=(10, 10))
+ax = fig.add_subplot(111, projection='3d')
+
+# Initialize plot
+robot_line, = ax.plot([], [], [], 'b-o', label="Robot Trajectory")
+obstacle_line, = ax.plot([], [], [], 'r--', label="Obstacle Path")
+target_point, = ax.plot([xd[0]], [xd[1]], [xd[2]], 'ro', label="Target")
+obstacle_spheres = []
+
+# Set axes
+ax.set_xlim(0, 1.5)
+ax.set_ylim(0, 1.5)
+ax.set_zlim(0, 1.5)
+ax.set_xlabel("X Position")
+ax.set_ylabel("Y Position")
+ax.set_zlabel("Z Position")
+ax.set_title("3D MPC Trajectory with Obstacle Avoidance")
+ax.grid()
+ax.legend()
+
+# Update function
+def update(frame):
+    robot_line.set_data(trajectory[:frame+1, 0], trajectory[:frame+1, 1])
+    robot_line.set_3d_properties(trajectory[:frame+1, 2])
+    
+    obstacle_line.set_data(obstacle_positions[:frame+1, 0], obstacle_positions[:frame+1, 1])
+    obstacle_line.set_3d_properties(obstacle_positions[:frame+1, 2])
+
+    # Remove old safety distance spheres
+    global obstacle_spheres
+    for sphere in obstacle_spheres:
+        sphere.remove()
+    obstacle_spheres = []
+
+    # Draw new safety distance spheres
+    if frame < len(obstacle_positions):
+        obstacle_pos = obstacle_positions[frame]
+        current_epsilon = epsilon_history[frame]
+        u, v = np.mgrid[0:2*np.pi:20j, 0:np.pi:10j]
+        x = obstacle_pos[0] + current_epsilon * np.cos(u) * np.sin(v)
+        y = obstacle_pos[1] + current_epsilon * np.sin(u) * np.sin(v)
+        z = obstacle_pos[2] + current_epsilon * np.cos(v)
+        ax.plot_surface(x, y, z, color='orange', alpha=0.3)
+
+    return robot_line, obstacle_line, target_point
+
+# Create animation with frame count set to min(len(trajectory), len(obstacle_positions))
+anim = FuncAnimation(fig, update, frames=min(len(trajectory), len(obstacle_positions)), interval=200, blit=False)
+
+# Save as GIF
+anim.save('3d_trajectory.gif', writer='pillow')
+
+# Display the last frame
+plt.show()
+
+# Plot epsilon variation over time
+plt.figure(figsize=(10, 6))
+plt.plot(np.arange(len(epsilon_history)) * dt, epsilon_history, label='Epsilon over time', color='b')
+plt.xlabel('Time (s)')
+plt.ylabel('Epsilon')
+plt.title('Epsilon Variation Over Time')
+plt.grid()
+plt.legend()
+plt.show()
