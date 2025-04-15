@@ -1,0 +1,302 @@
+import cvxpy as cp
+import numpy as np
+import matplotlib.pyplot as plt
+import time  # For timing
+from mpl_toolkits.mplot3d import Axes3D  # For 3D plotting
+from matplotlib.animation import FuncAnimation, PillowWriter
+
+# ====================== 3D High-Order CBF Controller with Input Constraints and Timing ======================
+def HOCBF_controller_3D(p, v, u_nom, p_obs, r_obs, delta, alpha1=1.0, alpha2=1.0):
+    """
+    3D High-Order CBF Controller with acceleration limits.
+    Inputs:
+      p     : Current robot position, shape (3,)
+      v     : Current robot velocity, shape (3,)
+      u_nom : Nominal control input from MPC, shape (3,)
+      p_obs : Current obstacle position, shape (3,)
+      r_obs : Obstacle radius (scalar)
+      delta : Safety margin (scalar)
+      alpha1, alpha2 : HOCBF design parameters (positive scalars)
+    Outputs:
+      u      : Safe control input (shape (3,)) satisfying the HOCBF constraint and input bounds;
+               if QP fails, returns u_nom.
+      hocbf_time : Optimization time for this HOCBF QP (in seconds)
+    """
+    # Compute the difference between robot position and obstacle center
+    diff = p - p_obs  # 3D vector
+
+    # Define barrier function: h(x) = ||p - p_obs||^2 - (r_obs + delta)^2
+    h = np.dot(diff, diff) - (r_obs + delta)**2
+
+    # Compute its time derivative: h_dot = 2*(p-p_obs)^T * v
+    h_dot = 2 * np.dot(diff, v)
+
+    # Define auxiliary function: psi = h_dot + alpha1 * h
+    psi = h_dot + alpha1 * h
+
+    # Compute the derivative of psi:
+    # psi_dot = 2*||v||^2 + 2*(p-p_obs)^T * u + 2*alpha1*(p-p_obs)^T * v
+    # The safety condition: psi_dot + alpha2 * psi >= 0
+    # Rearranging, we get a linear constraint in u:
+    # 2*(p-p_obs)^T * u >= -2*||v||^2 - 2*alpha1*(p-p_obs)^T*v - alpha2*(2*(p-p_obs)^T*v + alpha1*h)
+    A_cbf = 2 * diff  # 1x3 row vector
+    v_norm_sq = np.dot(v, v)
+    diff_dot_v = np.dot(diff, v)
+    B_cbf = -2 * v_norm_sq - 2 * alpha1 * diff_dot_v - alpha2 * (2 * diff_dot_v + alpha1 * h)
+
+    # Formulate a small QP to adjust u_nom while keeping it close to u_nom and satisfying the safety constraint.
+    # Also add input constraint: u in [-9, 9]^3.
+    u_var = cp.Variable(3)
+    objective = cp.Minimize(cp.sum_squares(u_var - u_nom))
+    constraints = [A_cbf @ u_var >= B_cbf,
+                   u_var >= -9 * np.ones(3),
+                   u_var <=  9 * np.ones(3)]
+    prob = cp.Problem(objective, constraints)
+
+    start_time = time.time()  # Start timing for HOCBF QP
+    prob.solve(solver=cp.OSQP)
+    hocbf_time = time.time() - start_time  # Compute elapsed time
+
+    if prob.status not in ["optimal", "optimal_inaccurate"]:
+        print("HOCBF QP failed, returning nominal control")
+        return u_nom, hocbf_time
+    return u_var.value, hocbf_time
+
+# ====================== MPC Problem Setup with State and Input Constraints and Timing ======================
+def solve_MPC(x0, p_target, N, dt, Q, R):
+    """
+    Solve an MPC problem for a 3D double integrator with state and input constraints.
+    The state x = [p; v] in R^6, where p and v are in R^3.
+    Dynamics: x[k+1] = A_d * x[k] + B_d * u[k],
+    with
+         A_d = [ I, dt*I;
+                 0,  I   ],
+         B_d = [ 0;
+                 dt*I ].
+    The cost function includes a tracking cost for position and a control effort cost.
+    Additionally, constraints are added:
+      - Position p ∈ [0, 1]^3 (i.e., within a 1m×1m×1m cube)
+      - Velocity v ∈ [-1.5, 1.5]^3
+      - Control input u ∈ [-9, 9]^3
+    Inputs:
+      x0      : Current state, 6-vector [p; v]
+      p_target: Desired target position, 3-vector
+      N       : Prediction horizon (integer)
+      dt      : Time step (scalar)
+      Q       : Weight matrix for position error (3x3)
+      R       : Weight matrix for control effort (3x3)
+    Outputs:
+      u_nom    : First control input from the MPC solution (3-vector)
+      mpc_time : Optimization time for the MPC QP (in seconds)
+    """
+    # Discrete-time dynamics matrices for the 3D double integrator
+    A_d = np.block([[np.eye(3), dt*np.eye(3)],
+                    [np.zeros((3,3)), np.eye(3)]])
+    B_d = np.block([[np.zeros((3,3))],
+                    [dt*np.eye(3)]])
+    
+    # Decision variables: x ∈ R^(6 x (N+1)), u ∈ R^(3 x N)
+    x = cp.Variable((6, N+1))
+    u = cp.Variable((3, N))
+    
+    cost = 0
+    constraints = []
+    
+    # Initial condition
+    constraints += [x[:, 0] == x0]
+    
+    # Add state and input constraints for each time step in the horizon
+    for k in range(N):
+        # Dynamics constraints
+        constraints += [x[:, k+1] == A_d @ x[:, k] + B_d @ u[:, k]]
+        # State constraints: position in [0, 1]^3 and velocity in [-1.5, 1.5]^3
+        constraints += [x[0:3, k+1] >= 0,
+                        x[0:3, k+1] <= 1]
+        constraints += [x[3:6, k+1] >= -1.0,
+                        x[3:6, k+1] <= 1.0]
+        # Input constraints: u ∈ [-9, 9]^3
+        constraints += [u[:, k] >= -2,
+                        u[:, k] <= 2]
+        # Accumulate cost: tracking cost and control effort cost
+        cost += cp.quad_form(x[0:3, k+1] - p_target, Q)
+        cost += cp.quad_form(u[:, k], R)
+        
+    # Terminal cost on the final position error
+    cost += cp.quad_form(x[0:3, N] - p_target, Q)
+    
+    # Solve the MPC QP
+    prob = cp.Problem(cp.Minimize(cost), constraints)
+    start_time = time.time()  # Start timing for MPC QP
+    prob.solve(solver=cp.OSQP)
+    mpc_time = time.time() - start_time  # Compute elapsed time
+    
+    if prob.status not in ["optimal", "optimal_inaccurate"]:
+        print("MPC QP failed, using zero control")
+        return np.zeros(3), mpc_time
+    
+    # Return the first control input from the MPC solution and the time
+    return u.value[:, 0], mpc_time
+
+# ====================== Simulation Parameters ======================
+dt = 0.05      # Time step (seconds)
+T = 10.0       # Total simulation time (seconds)
+steps = int(T / dt)
+N = 10         # MPC prediction horizon
+
+# MPC weight matrices
+Q = np.eye(3)         # Weight on position error
+R = 0.1 * np.eye(3)   # Weight on control effort
+
+# Initial state (ensure within the 1m cube and velocity limits)
+p = np.array([0.3, 0.1, 0.5])   # Initial position (in [0,1]^3)
+v = np.array([0.1, 0.9, 0.1])     # Initial velocity (in [-1.5,1.5]^3)
+
+# Target state (within the 1m cube)
+p_target = np.array([0.9, 0.9, 0.9])
+v_target = np.array([0.0, 0.0, 0.0])  # (Not used directly in cost)
+
+# Safety margin for obstacle avoidance
+delta = 0.2  # Adjust as needed
+
+# Gaussian noise standard deviation for obstacle radius (in m)
+noise_std = 0.01
+
+# Lists to record trajectories and optimization times
+p_traj = [p.copy()]          # Robot position trajectory
+v_traj = [v.copy()]          # Robot velocity trajectory
+u_traj = []                  # Control inputs applied (after safety filter)
+p_obs_traj = []              # Obstacle center trajectory
+r_obs_traj = []              # Obstacle radius trajectory
+
+mpc_times = []   # List to store MPC optimization times
+hocbf_times = [] # List to store HOCBF optimization times
+
+# ====================== Simulation Loop ======================
+for k in range(steps):
+    t = k * dt
+    # Define a dynamic obstacle within the unit cube.
+    # Obstacle center is generated with smaller amplitude and centered at 0.5,
+    # ensuring it remains in [0,1]^3.
+    p_obs = np.array([0.5 + 0.2 * np.sin(1.0 * t),
+                      0.5 + 0.2 * np.cos(1.0 * t),
+                      0.5 + 0.1 * np.sin(0.2 * t)])
+    
+    t_norm = min(t / T, 1.0)  # Normalize time to range [0,1]
+
+    # Linear trajectory: obstacle moves from (1,0,0) to (0,1,1)
+    #p_start = np.array([1.0, 0.0, 0.0])
+    #p_end = np.array([0.0, 1.0, 1.0])
+    #pv=np.array([-0.5,0.5,0.5])
+    #p_obs = p_start+t*pv  # Linear interpolation
+    # Nominal obstacle radius (dynamic, then add Gaussian noise)
+    r_obs_nom = 0.2 + 0.05 * np.cos(1.5 * t)  # around 0.2 m
+    r_obs = r_obs_nom + np.random.randn() * noise_std
+    r_obs = max(r_obs, 0.05)  # Ensure radius is at least 0.05 m
+    
+    # Save obstacle data
+    p_obs_traj.append(p_obs.copy())
+    r_obs_traj.append(r_obs)
+    
+    # Form current state x0 for MPC: x = [p; v]
+    x0 = np.concatenate((p, v))
+    
+    # Solve MPC to get the nominal control input and record MPC time
+    u_nom, mpc_time = solve_MPC(x0, p_target, N, dt, Q, R)
+    mpc_times.append(mpc_time)
+    
+    #p_obs_future = p_obs + dt * pv
+    # Use HOCBF safety filter to modify u_nom and record HOCBF QP time
+    u_safe, hocbf_time = HOCBF_controller_3D(p, v, u_nom, p_obs, r_obs, delta, alpha1=2.0, alpha2=5.0)
+    hocbf_times.append(hocbf_time)
+    
+    # Update the state using Euler integration
+    p = p + dt * v
+    v = v + dt * u_safe
+    
+    # Enforce state constraints manually (to handle numerical errors)
+    p = np.clip(p, 0, 1)
+    v = np.clip(v, -1.5, 1.5)
+    
+    # Record data
+    p_traj.append(p.copy())
+    v_traj.append(v.copy())
+    u_traj.append(u_safe.copy())
+
+# Convert recorded lists to NumPy arrays for plotting and analysis
+p_traj = np.array(p_traj)         # Shape: (steps+1, 3)
+p_obs_traj = np.array(p_obs_traj)   # Shape: (steps, 3)
+r_obs_traj = np.array(r_obs_traj)   # Shape: (steps,)
+
+# Compute statistics for MPC and HOCBF optimization times
+mpc_times = np.array(mpc_times)
+hocbf_times = np.array(hocbf_times)
+
+print("MPC Optimization Time (s): min = {:.6f}, max = {:.6f}, avg = {:.6f}".format(
+    mpc_times.min(), mpc_times.max(), mpc_times.mean()))
+print("HOCBF Optimization Time (s): min = {:.6f}, max = {:.6f}, avg = {:.6f}".format(
+    hocbf_times.min(), hocbf_times.max(), hocbf_times.mean()))
+
+# ====================== Create Animation GIF ======================
+fig = plt.figure()
+ax = fig.add_subplot(111, projection='3d')
+
+# For the unit cube, set fixed limits [0,1] for all axes.
+ax.set_xlim(0, 1)
+ax.set_ylim(0, 1)
+ax.set_zlim(0, 1)
+
+def update(frame):
+    ax.cla()  # Clear previous plot
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_zlim(0, 1)
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.set_title('Time = {:.2f} s'.format(frame * dt))
+    
+    # Plot robot trajectory up to the current frame
+    ax.plot(p_traj[:frame, 0], p_traj[:frame, 1], p_traj[:frame, 2],
+            'b-', label='Robot Trajectory')
+    
+    # Plot obstacle trajectory up to the current frame
+    if frame > 0:
+        idx = frame if frame <= len(p_obs_traj) else len(p_obs_traj)
+        ax.plot(p_obs_traj[:idx, 0], p_obs_traj[:idx, 1], p_obs_traj[:idx, 2],
+                'g--', label='Obstacle Trajectory')
+    
+    # Plot current robot position
+    ax.scatter(p_traj[frame, 0], p_traj[frame, 1], p_traj[frame, 2],
+               c='b', s=50, marker='o', label='Robot')
+    
+    # Plot current obstacle position (if available)
+    if frame > 0:
+        idx = frame - 1 if frame - 1 < len(p_obs_traj) else -1
+        ax.scatter(p_obs_traj[idx, 0], p_obs_traj[idx, 1], p_obs_traj[idx, 2],
+                   c='g', s=50, marker='^', label='Obstacle')
+    
+    ax.legend()
+
+ani = FuncAnimation(fig, update, frames=len(p_traj), interval=50)
+writer = PillowWriter(fps=20)
+ani.save("mpc_hocbf_robot_obstacle_constrained.gif", writer=writer)
+print("GIF saved as mpc_hocbf_robot_obstacle_constrained.gif")
+
+# ====================== Plot Distance and Obstacle Radius vs. Time ======================
+# Compute the Euclidean distance between the robot and the obstacle at each time step.
+time_array = np.arange(1, steps + 1) * dt  # Time from dt to T
+distances = []
+for i in range(steps):
+    d = np.linalg.norm(p_traj[i+1] - p_obs_traj[i])
+    distances.append(d)
+distances = np.array(distances)
+
+plt.figure(figsize=(8, 4))
+plt.plot(time_array, distances, 'b-', label='Robot-Obstacle Distance')
+plt.plot(time_array, r_obs_traj, 'g--', label='Obstacle Radius')
+plt.xlabel('Time (s)')
+plt.ylabel('Distance (m)')
+plt.title('Robot-Obstacle Distance and Obstacle Radius vs. Time')
+plt.legend()
+plt.grid(True)
+plt.show()
